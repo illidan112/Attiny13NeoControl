@@ -7,6 +7,7 @@
 
 #include <avr/io.h>
 #include <util/delay.h>
+#include <avr/eeprom.h>
 
 // ===================================================================================
 // Pin definitions
@@ -31,16 +32,60 @@
 #define MODE_SOLID    1
 #define MODE_COUNT    2
 
+#define SOLID_HUE_STEP 4
+
 // ===================================================================================
 // Global settings
 // ===================================================================================
 
 uint8_t mode          = MODE_RAINBOW;
-uint8_t brightness    = 0;    // 0=100%, 1=50%, 2=25%, 3=12.5%
+uint8_t brightness    = 0;    // 0..7: 100%, 87.5%, 75%, 62.5%, 50%, 37.5%, 25%, 12.5%
 uint8_t rainbowStart  = 0;    // current rainbow offset, 0..191
 uint8_t rainbowSpeed  = 3;    // 1..8
 uint8_t rainbowDense  = 16;   // hue difference between neighboring pixels
 uint8_t solidHue      = 0;    // solid color, 0..191
+
+// ===================================================================================
+// Persistent settings (EEPROM)
+// ===================================================================================
+
+#define SETTINGS_MAGIC 0xA5
+
+uint8_t EEMEM ee_magic;
+uint8_t EEMEM ee_mode;
+uint8_t EEMEM ee_brightness;
+uint8_t EEMEM ee_rainbowSpeed;
+uint8_t EEMEM ee_solidHue;
+
+void SETTINGS_save(void) {
+  // update_byte writes only when the value really changed
+  eeprom_update_byte(&ee_mode,         mode);
+  eeprom_update_byte(&ee_brightness,   brightness);
+  eeprom_update_byte(&ee_rainbowSpeed, rainbowSpeed);
+  eeprom_update_byte(&ee_solidHue,     solidHue);
+  eeprom_update_byte(&ee_magic,        SETTINGS_MAGIC);
+}
+
+void SETTINGS_load(void) {
+  if(eeprom_read_byte(&ee_magic) != SETTINGS_MAGIC) {
+    SETTINGS_save();                    // first start: store defaults
+    return;
+  }
+
+  uint8_t value;
+
+  value = eeprom_read_byte(&ee_mode);
+  if(value < MODE_COUNT) mode = value;
+
+  value = eeprom_read_byte(&ee_brightness);
+  if(value <= 7) brightness = value;
+
+  value = eeprom_read_byte(&ee_rainbowSpeed);
+  if(value >= 1 && value <= 8) rainbowSpeed = value;
+
+  value = eeprom_read_byte(&ee_solidHue);
+  if(value < 192) solidHue = value;
+}
 
 // ===================================================================================
 // Neopixel implementation for 9.6 MHz MCU clock and 800 kHz pixels
@@ -65,11 +110,25 @@ void NEO_sendByte(uint8_t byte) {
   );
 }
 
+// Apply one of 8 brightness levels using shifts only (no multiplication)
+uint8_t NEO_applyBrightness(uint8_t value) {
+  switch(brightness) {
+    case 1: return value - (value >> 3);             // 87.5%
+    case 2: return value - (value >> 2);             // 75%
+    case 3: return (value >> 1) + (value >> 3);      // 62.5%
+    case 4: return value >> 1;                       // 50%
+    case 5: return (value >> 2) + (value >> 3);      // 37.5%
+    case 6: return value >> 2;                       // 25%
+    case 7: return value >> 3;                       // 12.5%
+    default: return value;                           // 100%
+  }
+}
+
 // Write color to a single pixel; brightness is applied to every mode here
 void NEO_writeColor(uint8_t r, uint8_t g, uint8_t b) {
-  r >>= brightness;
-  g >>= brightness;
-  b >>= brightness;
+  r = NEO_applyBrightness(r);
+  g = NEO_applyBrightness(g);
+  b = NEO_applyBrightness(b);
 
   #if defined (NEO_GRB)
     NEO_sendByte(g); NEO_sendByte(r); NEO_sendByte(b);
@@ -122,23 +181,27 @@ uint8_t BTN_readPress(void) {
 
 void BTN_handle(void) {
   uint8_t pressed = BTN_readPress();
+  uint8_t changed = 0;
 
   if(pressed & (1<<BTN_MODE)) {
     if(++mode >= MODE_COUNT) mode = 0;
+    changed = 1;
   }
 
   if(pressed & (1<<BTN_BRIGHT)) {
-    if(++brightness > 3) brightness = 0;
+    if(++brightness > 7) brightness = 0;
+    changed = 1;
   }
 
   if(pressed & (1<<BTN_UP)) {
     if(mode == MODE_RAINBOW) {
-      if(++rainbowSpeed > 8) rainbowSpeed = 1;
+      if(++rainbowSpeed > SOLID_HUE_STEP) rainbowSpeed = 1;
     }
     else {
-      solidHue += 8;
+      solidHue += SOLID_HUE_STEP;
       if(solidHue >= 192) solidHue -= 192;
     }
+    changed = 1;
   }
 
   if(pressed & (1<<BTN_DOWN)) {
@@ -147,10 +210,13 @@ void BTN_handle(void) {
       else rainbowSpeed = 8;
     }
     else {
-      if(solidHue < 8) solidHue += 192;
-      solidHue -= 8;
+      if(solidHue < SOLID_HUE_STEP) solidHue += 192;
+      solidHue -= SOLID_HUE_STEP;
     }
+    changed = 1;
   }
+
+  if(changed) SETTINGS_save();
 }
 
 // Wait between frames while still polling the buttons
@@ -192,6 +258,7 @@ int main(void) {
   ACSR = (1<<ACD);
   PRR  = (1<<PRADC);
 
+  SETTINGS_load();
   NEO_init();
   BTN_init();
 
