@@ -26,13 +26,14 @@
 // ===================================================================================
 
 #define NEO_GRB               // WS2812B: green, red, blue
-#define NEO_PIXELS    5       // number of pixels in the string
+#define NEO_PIXELS    15       // number of pixels in the string
 
 #define MODE_RAINBOW  0
 #define MODE_SOLID    1
-#define MODE_COUNT    2
+#define MODE_FIRE     2
+#define MODE_COUNT    3
 
-#define SOLID_HUE_STEP 4
+#define RAINBOW_DENSE 16
 
 // ===================================================================================
 // Global settings
@@ -42,8 +43,9 @@ uint8_t mode          = MODE_RAINBOW;
 uint8_t brightness    = 0;    // 0..7: 100%, 87.5%, 75%, 62.5%, 50%, 37.5%, 25%, 12.5%
 uint8_t rainbowStart  = 0;    // current rainbow offset, 0..191
 uint8_t rainbowSpeed  = 3;    // 1..8
-uint8_t rainbowDense  = 16;   // hue difference between neighboring pixels
 uint8_t solidHue      = 0;    // solid color, 0..191
+uint8_t fireHeat      = 96;   // fire color: green component, 48..144
+uint8_t fireRnd       = 0xA5; // compact 8-bit pseudo-random state
 
 // ===================================================================================
 // Persistent settings (EEPROM)
@@ -56,19 +58,20 @@ uint8_t EEMEM ee_mode;
 uint8_t EEMEM ee_brightness;
 uint8_t EEMEM ee_rainbowSpeed;
 uint8_t EEMEM ee_solidHue;
+uint8_t EEMEM ee_fireHeat;
 
 void SETTINGS_save(void) {
-  // update_byte writes only when the value really changed
   eeprom_update_byte(&ee_mode,         mode);
   eeprom_update_byte(&ee_brightness,   brightness);
   eeprom_update_byte(&ee_rainbowSpeed, rainbowSpeed);
   eeprom_update_byte(&ee_solidHue,     solidHue);
+  eeprom_update_byte(&ee_fireHeat,     fireHeat);
   eeprom_update_byte(&ee_magic,        SETTINGS_MAGIC);
 }
 
 void SETTINGS_load(void) {
   if(eeprom_read_byte(&ee_magic) != SETTINGS_MAGIC) {
-    SETTINGS_save();                    // first start: store defaults
+    SETTINGS_save();
     return;
   }
 
@@ -85,6 +88,9 @@ void SETTINGS_load(void) {
 
   value = eeprom_read_byte(&ee_solidHue);
   if(value < 192) solidHue = value;
+
+  value = eeprom_read_byte(&ee_fireHeat);
+  if(value >= 48 && value <= 144) fireHeat = value;
 }
 
 // ===================================================================================
@@ -92,7 +98,6 @@ void SETTINGS_load(void) {
 // ===================================================================================
 
 #define NEO_init()    DDRB |= (1<<NEO_PIN)
-#define NEO_latch()   _delay_us(281)
 
 // Send a byte to the pixel string
 void NEO_sendByte(uint8_t byte) {
@@ -113,18 +118,17 @@ void NEO_sendByte(uint8_t byte) {
 // Apply one of 8 brightness levels using shifts only (no multiplication)
 uint8_t NEO_applyBrightness(uint8_t value) {
   switch(brightness) {
-    case 1: return value - (value >> 3);             // 87.5%
-    case 2: return value - (value >> 2);             // 75%
-    case 3: return (value >> 1) + (value >> 3);      // 62.5%
-    case 4: return value >> 1;                       // 50%
-    case 5: return (value >> 2) + (value >> 3);      // 37.5%
-    case 6: return value >> 2;                       // 25%
-    case 7: return value >> 3;                       // 12.5%
-    default: return value;                           // 100%
+    case 1: return value - (value >> 3);
+    case 2: return value - (value >> 2);
+    case 3: return (value >> 1) + (value >> 3);
+    case 4: return value >> 1;
+    case 5: return (value >> 2) + (value >> 3);
+    case 6: return value >> 2;
+    case 7: return value >> 3;
+    default: return value;
   }
 }
 
-// Write color to a single pixel; brightness is applied to every mode here
 void NEO_writeColor(uint8_t r, uint8_t g, uint8_t b) {
   r = NEO_applyBrightness(r);
   g = NEO_applyBrightness(g);
@@ -141,22 +145,20 @@ void NEO_writeColor(uint8_t r, uint8_t g, uint8_t b) {
   #endif
 }
 
-// Write hue 0..191 to one pixel at full color range
 void NEO_writeHue(uint8_t hue) {
   uint8_t phase = hue >> 6;
-  uint8_t step  = (hue & 63) << 2;   // 0..252
+  uint8_t step  = (hue & 63) << 2;
   uint8_t nstep = 252 - step;
 
   switch(phase) {
-    case 0: NEO_writeColor(nstep, step, 0);     break; // red -> green
-    case 1: NEO_writeColor(0, nstep, step);     break; // green -> blue
-    case 2: NEO_writeColor(step, 0, nstep);     break; // blue -> red
+    case 0: NEO_writeColor(nstep, step, 0); break;
+    case 1: NEO_writeColor(0, nstep, step); break;
+    case 2: NEO_writeColor(step, 0, nstep); break;
   }
 }
 
 // ===================================================================================
 // Buttons
-// Each button connects its pin to GND. Internal pull-ups are enabled.
 // ===================================================================================
 
 void BTN_init(void) {
@@ -164,8 +166,7 @@ void BTN_init(void) {
   PORTB |= BUTTON_MASK;
 }
 
-// Returns only newly pressed buttons (simple debounce, no auto-repeat)
-uint8_t BTN_readPress(void) {
+static inline uint8_t BTN_readPress(void) {
   static uint8_t last = 0;
   uint8_t now = (~PINB) & BUTTON_MASK;
 
@@ -195,11 +196,15 @@ void BTN_handle(void) {
 
   if(pressed & (1<<BTN_UP)) {
     if(mode == MODE_RAINBOW) {
-      if(++rainbowSpeed > SOLID_HUE_STEP) rainbowSpeed = 1;
+      if(++rainbowSpeed > 8) rainbowSpeed = 1;
+    }
+    else if(mode == MODE_SOLID) {
+      solidHue += 8;
+      if(solidHue >= 192) solidHue -= 192;
     }
     else {
-      solidHue += SOLID_HUE_STEP;
-      if(solidHue >= 192) solidHue -= 192;
+      if(fireHeat < 144) fireHeat += 16;
+      else fireHeat = 48;
     }
     changed = 1;
   }
@@ -209,9 +214,13 @@ void BTN_handle(void) {
       if(rainbowSpeed > 1) rainbowSpeed--;
       else rainbowSpeed = 8;
     }
+    else if(mode == MODE_SOLID) {
+      if(solidHue < 8) solidHue += 192;
+      solidHue -= 8;
+    }
     else {
-      if(solidHue < SOLID_HUE_STEP) solidHue += 192;
-      solidHue -= SOLID_HUE_STEP;
+      if(fireHeat > 48) fireHeat -= 16;
+      else fireHeat = 144;
     }
     changed = 1;
   }
@@ -219,7 +228,6 @@ void BTN_handle(void) {
   if(changed) SETTINGS_save();
 }
 
-// Wait between frames while still polling the buttons
 void waitFrame(uint8_t ms) {
   while(ms--) {
     BTN_handle();
@@ -231,12 +239,12 @@ void waitFrame(uint8_t ms) {
 // Lighting modes
 // ===================================================================================
 
-void modeRainbow(void) {
+static inline void modeRainbow(void) {
   uint8_t current = rainbowStart;
 
   for(uint8_t i=NEO_PIXELS; i; i--) {
     NEO_writeHue(current);
-    current += rainbowDense;
+    current += RAINBOW_DENSE;
     if(current >= 192) current -= 192;
   }
 
@@ -244,9 +252,23 @@ void modeRainbow(void) {
   if(rainbowStart >= 192) rainbowStart -= 192;
 }
 
-void modeSolid(void) {
+static inline void modeSolid(void) {
   for(uint8_t i=NEO_PIXELS; i; i--)
     NEO_writeHue(solidHue);
+}
+
+// Compact 8-bit maximal-length LFSR.
+// Much cheaper on ATtiny13A than the previous 16-bit implementation.
+static inline uint8_t FIRE_random(void) {
+  fireRnd = (fireRnd >> 1) ^ ((uint8_t)-(fireRnd & 1) & 0xB8);
+  return fireRnd;
+}
+
+void modeFire(void) {
+  for(uint8_t i=NEO_PIXELS; i; i--) {
+    uint8_t flicker = FIRE_random() & 31;
+    NEO_writeColor(255 - (flicker >> 1), fireHeat - flicker, 0);
+  }
 }
 
 // ===================================================================================
@@ -254,7 +276,6 @@ void modeSolid(void) {
 // ===================================================================================
 
 int main(void) {
-  // Disable unused analog peripherals
   ACSR = (1<<ACD);
   PRR  = (1<<PRADC);
 
@@ -266,9 +287,11 @@ int main(void) {
     switch(mode) {
       case MODE_RAINBOW: modeRainbow(); break;
       case MODE_SOLID:   modeSolid();   break;
+      case MODE_FIRE:    modeFire();    break;
     }
 
-    NEO_latch();
+    // waitFrame(40) keeps DATA LOW far longer than the WS2812 reset/latch time,
+    // so a separate NEO_latch() delay is unnecessary.
     waitFrame(40);
   }
 }
